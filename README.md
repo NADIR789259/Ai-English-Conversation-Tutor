@@ -248,11 +248,18 @@ The tests cover the speech-confidence calculation and the session-summary databa
 - [ ] Mobile client
 - [ ] More automated tests, including provider connectivity checks
 
-## Author
+## 👨‍💻 Author
 
 **Nadir Khan**
-Diploma in Computer Engineering, Ch. Bansi Lal Government Polytechnic, Bhiwani
-GitHub: [@NADIR789259](https://github.com/NADIR789259)
+
+Diploma in Computer Engineering  
+Ch. Bansi Lal Government Polytechnic, Bhiwani
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Nadir%20Khan-blue?style=flat&logo=linkedin)](https://www.linkedin.com/in/nadirkhan-dataanalyst/)
+[![GitHub](https://img.shields.io/badge/GitHub-NADIR789259-black?style=flat&logo=github)](https://github.com/NADIR789259)
+[![Portfolio](https://img.shields.io/badge/Portfolio-Visit%20Website-success?style=flat&logo=google-chrome)](https://nadir789259.github.io/)
+[![Email](https://img.shields.io/badge/Email-nadirkhan5864%40gmail.com-red?style=flat&logo=gmail)](mailto:nadirkhan5864@gmail.com)
+
 
 ## License
 
