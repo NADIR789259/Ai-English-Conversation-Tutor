@@ -47,19 +47,19 @@ An AI-powered English practice application that runs on your own computer. Chat 
 
 | Text conversation with IPA | Grammar correction and natural expression |
 |:---:|:---:|
-| <img src="docs/screenshots/02-text-conversation.png" width="420"> | <img src="docs/screenshots/03-grammar-correction.png" width="420"> |
+| <img src="ai-english-conversation-tutor/docs/assets/02-text-conversation.png" width="420"> | <img src="ai-english-conversation-tutor/docs/assets/03-grammar-correction.png" width="420"> |
 
 | Voice recording | Voice transcription |
 |:---:|:---:|
-| <img src="docs/screenshots/04-voice-recording.png" width="420"> | <img src="docs/screenshots/05-voice-transcription.png" width="420"> |
+| <img src="ai-english-conversation-tutor/docs/assets/04-voice-recording.png" width="420"> | <img src="ai-english-conversation-tutor/docs/assets/05-voice-transcription.png" width="420"> |
 
 | Speech recognition confidence | Review mode |
 |:---:|:---:|
-| <img src="docs/screenshots/06-asr-confidence.png" width="420"> | <img src="docs/screenshots/07-review-mode.png" width="420"> |
+| <img src="ai-english-conversation-tutor/docs/assets/06-asr-confidence.png" width="420"> | <img src="ai-english-conversation-tutor/docs/assets/07-review-mode.png" width="420"> |
 
 | Weakness dashboard |
 |:---:|
-| <img src="docs/screenshots/08-weakness-dashboard.png" width="420"> |
+| <img src="ai-english-conversation-tutor/docs/assets/08-weakness-dashboard.png" width="420"> |
 
 ## How It Works
 
