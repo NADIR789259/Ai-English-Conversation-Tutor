@@ -1,0 +1,1682 @@
+"""
+AI English Conversation Tutor - backend server
+Supports FastAPI + Ollama/OpenAI
+"""
+
+import asyncio
+import json
+import locale
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+from threading import Lock
+from typing import Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+import config
+import db
+from review_logic import judge_review_answer
+
+# ============================================================
+# Application initialization
+# ============================================================
+app = FastAPI(title="AI English Conversation Tutor")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+faster_whisper_model = None
+faster_whisper_lock = Lock()
+
+# ============================================================
+# IPA pronunciation data (basic English word pronunciation dictionary)
+# ============================================================
+# Simple IPA conversion based on the CMU Pronouncing Dictionary
+# Use eng_to_ipa if the library is available
+try:
+    import eng_to_ipa
+    HAS_IPA_LIB = True
+except ImportError:
+    HAS_IPA_LIB = False
+
+# ARPAbet-to-IPA conversion map
+ARPABET_TO_IPA = {
+    'AA': 'ɑː', 'AE': 'æ', 'AH': 'ʌ', 'AO': 'ɔː', 'AW': 'aʊ',
+    'AY': 'aɪ', 'B': 'b', 'CH': 'tʃ', 'D': 'd', 'DH': 'ð',
+    'EH': 'ɛ', 'ER': 'ɜːr', 'EY': 'eɪ', 'F': 'f', 'G': 'ɡ',
+    'HH': 'h', 'IH': 'ɪ', 'IY': 'iː', 'JH': 'dʒ', 'K': 'k',
+    'L': 'l', 'M': 'm', 'N': 'n', 'NG': 'ŋ', 'OW': 'oʊ',
+    'OY': 'ɔɪ', 'P': 'p', 'R': 'r', 'S': 's', 'SH': 'ʃ',
+    'T': 't', 'TH': 'θ', 'UH': 'ʊ', 'UW': 'uː', 'V': 'v',
+    'W': 'w', 'Y': 'j', 'Z': 'z', 'ZH': 'ʒ',
+}
+
+# Load the CMU dictionary
+cmu_dict: dict[str, str] = {}
+
+def load_cmu_dict():
+    """Load the CMU pronunciation dictionary."""
+    global cmu_dict
+    try:
+        import nltk
+        nltk.download('cmudict', quiet=True)
+        from nltk.corpus import cmudict
+        entries = cmudict.entries()
+        for word, phones in entries:
+            ipa_phones = []
+            for phone in phones:
+                # Remove the stress number
+                clean = re.sub(r'\d', '', phone)
+                if clean in ARPABET_TO_IPA:
+                    ipa_phones.append(ARPABET_TO_IPA[clean])
+            cmu_dict[word.lower()] = ''.join(ipa_phones)
+        print(f"CMU dictionary loaded: {len(cmu_dict)} words")
+    except Exception as e:
+        print(f"CMU dictionary load failed (using simple mode): {e}")
+
+
+def get_ipa(word: str) -> str:
+    """Get the IPA pronunciation for a word."""
+    word_lower = word.lower().strip(".,!?;:'\"")
+    if not word_lower:
+        return ""
+
+    # Prefer eng_to_ipa if the library is available
+    if HAS_IPA_LIB:
+        result = eng_to_ipa.convert(word_lower)
+        if result and '*' not in result:
+            return result
+
+    # Look up the word in the CMU dictionary
+    if word_lower in cmu_dict:
+        return cmu_dict[word_lower]
+
+    return ""
+
+
+def get_sentence_ipa(sentence: str) -> list[dict]:
+    """Get IPA pronunciations for the entire sentence."""
+    words = re.findall(r"[a-zA-Z']+|[.,!?;:]", sentence)
+    result = []
+    for word in words:
+        ipa = get_ipa(word)
+        result.append({
+            "word": word,
+            "ipa": ipa if ipa else None
+        })
+    return result
+
+
+# ============================================================
+# Legacy ASR probability heuristic (unused; retained for compatibility with the previous format)
+# ============================================================
+# Word-level thresholds (based on faster-whisper's per-word recognition probability)
+WORD_LEVEL_GOOD_THRESHOLD = 0.85   # good at or above this value (clearly pronounced)
+WORD_LEVEL_FAIR_THRESHOLD = 0.60   # fair at or above this value; poor below it (needs practice)
+
+# Penalty for low-probability words (points deducted per word)
+POOR_WORD_PENALTY = 5
+FAIR_WORD_PENALTY = 2
+
+
+def score_word_level(probability: float) -> str:
+    """Convert a word's recognition probability to a good / fair / poor level."""
+    if probability >= WORD_LEVEL_GOOD_THRESHOLD:
+        return "good"
+    if probability >= WORD_LEVEL_FAIR_THRESHOLD:
+        return "fair"
+    return "poor"
+
+
+def _legacy_calculate_pronunciation_score_acoustic(words: list) -> Optional[dict]:
+    """
+    Legacy ASR word-probability heuristic. Not called by the current API.
+    - Uses average probability as the main component (average prob 0.95 → equivalent to 95 points)
+    - Applies a penalty based on the number of low-probability words (poor/fair)
+    Returns None if there is no valid word data, so the caller can use a fallback.
+    """
+    word_scores = []
+    probs = []
+    for entry in words or []:
+        # Input comes from frontend JSON, so silently skip non-dicts and missing values
+        if not isinstance(entry, dict):
+            continue
+        word = str(entry.get("word", "")).strip().strip(".,!?;:\"")
+        try:
+            prob = float(entry.get("probability"))
+        except (TypeError, ValueError):
+            continue
+        if not word or not (0.0 <= prob <= 1.0):
+            continue
+        word_scores.append({
+            "word": word,
+            "score": round(prob * 100),
+            "level": score_word_level(prob),
+        })
+        probs.append(prob)
+
+    if not probs:
+        return None
+
+    # Convert average probability to a score out of 100 and penalize low-probability words
+    avg_prob = sum(probs) / len(probs)
+    poor_count = sum(1 for ws in word_scores if ws["level"] == "poor")
+    fair_count = sum(1 for ws in word_scores if ws["level"] == "fair")
+    penalty = poor_count * POOR_WORD_PENALTY + fair_count * FAIR_WORD_PENALTY
+    overall = max(0, min(100, round(avg_prob * 100 - penalty)))
+
+    details = f"Acoustic analysis: average recognition probability {round(avg_prob * 100)}%"
+    if poor_count:
+        details += f" / {poor_count} words need practice"
+
+    return {
+        "overall_score": overall,
+        "word_count": len(word_scores),
+        "unique_words": len({ws["word"].lower() for ws in word_scores}),
+        "details": details,
+        "method": "legacy_asr_probability",
+        "average_probability": round(avg_prob, 3),
+        "word_scores": word_scores,
+    }
+
+
+def _legacy_calculate_pronunciation_score(
+    recognized_text: str,
+    expected_text: Optional[str] = None,
+    words: Optional[list] = None,
+) -> dict:
+    """
+    Legacy text heuristic. Not called by the current API.
+    """
+    if not recognized_text.strip():
+        return {"overall_score": 0, "details": "No speech was detected.", "method": "legacy_text_heuristic"}
+
+    # Use acoustic scoring when per-word probabilities are available
+    acoustic = _legacy_calculate_pronunciation_score_acoustic(words)
+    if acoustic is not None:
+        return acoustic
+
+    text_words = re.findall(r"[a-zA-Z']+", recognized_text.lower())
+
+    if not text_words:
+        return {"overall_score": 0, "details": "No English was detected.", "method": "legacy_text_heuristic"}
+
+    # --- Traditional fallback: simple text-only score ---
+    # Base score (at least 60 once speech recognition succeeds)
+    base_score = 65
+
+    # Bonus based on sentence length and complexity
+    length_bonus = min(10, len(text_words) * 0.5)
+    complexity_bonus = min(10, len(set(text_words)) * 0.3)
+
+    # Score based on Web Speech API confidence
+    # (The frontend passes confidence when it is available in the browser)
+    recognition_bonus = 15  # Base bonus for successful recognition
+
+    score = min(100, base_score + length_bonus + complexity_bonus + recognition_bonus)
+
+    return {
+        "overall_score": round(score),
+        "word_count": len(text_words),
+        "unique_words": len(set(text_words)),
+        "details": "Speech recognition succeeded (simple text-only estimate).",
+        "method": "legacy_text_heuristic",
+    }
+
+
+# ============================================================
+# LLM clients
+# ============================================================
+def calculate_speech_recognition_confidence(words: Optional[list] = None) -> dict:
+    """Summarize ASR word probabilities without calling them pronunciation scores.
+
+    A speech recognizer's probability reflects confidence in its transcription.
+    It is not a measurement of phoneme accuracy, accent, rhythm, or intelligibility.
+    """
+    word_scores = []
+    probabilities = []
+    for entry in words or []:
+        if not isinstance(entry, dict):
+            continue
+        word = str(entry.get("word", "")).strip().strip(".,!?;:\"")
+        try:
+            probability = float(entry.get("probability"))
+        except (TypeError, ValueError):
+            continue
+        if not word or not 0.0 <= probability <= 1.0:
+            continue
+
+        if probability >= WORD_LEVEL_GOOD_THRESHOLD:
+            level = "high"
+        elif probability >= WORD_LEVEL_FAIR_THRESHOLD:
+            level = "medium"
+        else:
+            level = "low"
+        word_scores.append({
+            "word": word,
+            "score": round(probability * 100),
+            "level": level,
+        })
+        probabilities.append(probability)
+
+    if not probabilities:
+        return {
+            "overall_score": None,
+            "word_count": 0,
+            "details": "Speech-recognition confidence is unavailable for this input.",
+            "method": "unavailable",
+            "word_scores": [],
+        }
+
+    average = sum(probabilities) / len(probabilities)
+    return {
+        "overall_score": round(average * 100),
+        "word_count": len(word_scores),
+        "unique_words": len({item["word"].lower() for item in word_scores}),
+        "details": (
+            "Average ASR word probability. This is not a pronunciation-accuracy score."
+        ),
+        "method": "asr_word_probability",
+        "average_probability": round(average, 3),
+        "recognition_confidence": round(average * 100),
+        "word_scores": word_scores,
+    }
+
+
+def calculate_pronunciation_score(
+    recognized_text: str,
+    expected_text: Optional[str] = None,
+    words: Optional[list] = None,
+) -> dict:
+    """Backward-compatible API wrapper for speech-recognition confidence."""
+    del recognized_text, expected_text
+    return calculate_speech_recognition_confidence(words)
+
+
+async def call_ollama(messages: list[dict]) -> str:
+    """Ollama API - tries /api/chat first, falls back to /api/generate"""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        # --- Try /api/chat (Ollama >= 0.1.14) ---
+        try:
+            chat_payload = {
+                "model": config.OLLAMA_MODEL,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.7},
+            }
+            resp = await client.post(
+                f"{config.OLLAMA_BASE_URL}/api/chat",
+                json=chat_payload,
+            )
+            if resp.status_code != 404:
+                resp.raise_for_status()
+                data = resp.json()
+                return data["message"]["content"]
+        except httpx.ConnectError:
+            raise HTTPException(
+                status_code=503,
+                detail="Cannot connect to Ollama. Make sure Ollama is running.",
+            )
+        except httpx.HTTPStatusError:
+            pass  # fall through to /api/generate
+
+        # --- Fallback: /api/generate (older Ollama) ---
+        try:
+            # Convert messages to a single prompt string
+            prompt_parts = []
+            for msg in messages:
+                role = msg["role"]
+                content = msg["content"]
+                if role == "system":
+                    prompt_parts.append(f"System: {content}")
+                elif role == "user":
+                    prompt_parts.append(f"User: {content}")
+                elif role == "assistant":
+                    prompt_parts.append(f"Assistant: {content}")
+            prompt_parts.append("Assistant:")
+            prompt = "\n\n".join(prompt_parts)
+
+            gen_payload = {
+                "model": config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.7},
+            }
+            resp = await client.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json=gen_payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("response", "")
+        except httpx.ConnectError:
+            raise HTTPException(
+                status_code=503,
+                detail="Cannot connect to Ollama. Make sure Ollama is running.",
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Ollama API error: {str(e)}")
+
+
+async def call_openai(messages: list[dict]) -> str:
+    """Call the OpenAI API (reserved for future use)."""
+    import httpx
+
+    if not config.OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI API key is not configured.",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {config.OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": config.OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+
+async def call_anthropic(messages: list[dict]) -> str:
+    """Call the Anthropic Messages API."""
+    import httpx
+
+    if not config.ANTHROPIC_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Anthropic API key is not configured.",
+        )
+
+    system_parts = [msg["content"] for msg in messages if msg["role"] == "system"]
+    anthropic_messages = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in messages
+        if msg["role"] in ("user", "assistant")
+    ]
+
+    headers = {
+        "x-api-key": config.ANTHROPIC_API_KEY,
+        "anthropic-version": config.ANTHROPIC_API_VERSION,
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": config.ANTHROPIC_MODEL,
+        "max_tokens": config.ANTHROPIC_MAX_TOKENS,
+        "messages": anthropic_messages,
+    }
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            detail = "Anthropic API error."
+            try:
+                err_data = e.response.json()
+                detail = err_data.get("error", {}).get("message", detail)
+            except Exception:
+                if e.response.text:
+                    detail = e.response.text[:300]
+            raise HTTPException(status_code=502, detail=detail)
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Anthropic API error: {str(e)}",
+            )
+
+    data = resp.json()
+    text_parts = [
+        block.get("text", "")
+        for block in data.get("content", [])
+        if block.get("type") == "text"
+    ]
+    return "\n".join(part for part in text_parts if part).strip()
+
+
+def get_llm_display_name() -> str:
+    """Get the LLM name for display in the UI."""
+    if config.LLM_PROVIDER == "ollama":
+        return f"ollama:{config.OLLAMA_MODEL}"
+    if config.LLM_PROVIDER == "openai":
+        return f"openai:{config.OPENAI_MODEL}"
+    if config.LLM_PROVIDER == "anthropic":
+        return f"anthropic:{config.ANTHROPIC_MODEL}"
+    return config.LLM_PROVIDER
+
+
+def is_llm_ready() -> bool:
+    """Check whether the current LLM configuration is available."""
+    if config.LLM_PROVIDER == "ollama":
+        return True
+    if config.LLM_PROVIDER == "openai":
+        return bool(config.OPENAI_API_KEY)
+    if config.LLM_PROVIDER == "anthropic":
+        return bool(config.ANTHROPIC_API_KEY)
+    return False
+
+
+def is_faster_whisper_available() -> bool:
+    """Check whether faster-whisper is available."""
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def is_stt_ready() -> bool:
+    """Check whether server-side STT is available."""
+    if config.STT_PROVIDER == "faster_whisper":
+        return is_faster_whisper_available()
+    if config.STT_PROVIDER == "openai":
+        return bool(config.OPENAI_API_KEY)
+    if config.STT_PROVIDER == "disabled":
+        return True
+    return False
+
+
+def get_stt_display_name() -> str:
+    """Get the STT name for display in the UI."""
+    if config.STT_PROVIDER == "faster_whisper":
+        return f"faster_whisper:{config.FASTER_WHISPER_MODEL}"
+    if config.STT_PROVIDER == "openai":
+        return f"openai:{config.OPENAI_WHISPER_MODEL}"
+    return config.STT_PROVIDER
+
+
+# ============================================================
+# TTS (text-to-speech)
+# ============================================================
+# Text length limit for /api/tts (long text is expected to be handled by browser TTS)
+TTS_MAX_TEXT_LENGTH = 1000
+
+
+def is_edge_tts_available() -> bool:
+    """Check whether the edge-tts library is available."""
+    try:
+        import edge_tts  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def is_tts_ready() -> bool:
+    """Check whether server-side TTS is available."""
+    if config.TTS_PROVIDER == "edge":
+        return is_edge_tts_available()
+    if config.TTS_PROVIDER == "openai":
+        return bool(config.OPENAI_API_KEY)
+    if config.TTS_PROVIDER == "browser":
+        return True  # Always report as available because TTS is delegated to the client
+    return False
+
+
+async def synthesize_speech_edge(text: str, voice: str) -> bytes:
+    """Generate MP3 bytes from text using edge-tts."""
+    try:
+        import edge_tts
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="edge-tts is not installed. Run: pip install edge-tts",
+        )
+
+    communicate = edge_tts.Communicate(
+        text,
+        voice or config.EDGE_TTS_VOICE,
+        rate=config.EDGE_TTS_RATE,
+    )
+
+    # Collect audio chunks from the stream and assemble the MP3
+    audio_chunks = []
+    try:
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio" and chunk.get("data"):
+                audio_chunks.append(chunk["data"])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"edge-tts synthesis failed: {str(e)}")
+
+    audio = b"".join(audio_chunks)
+    if not audio:
+        raise HTTPException(status_code=502, detail="edge-tts returned no audio.")
+    return audio
+
+
+async def synthesize_speech_openai(text: str, voice: str) -> bytes:
+    """Generate MP3 bytes from text using the OpenAI Audio Speech API."""
+    import httpx
+
+    if not config.OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Server-side TTS is not configured. Set OPENAI_API_KEY in the environment or .env.",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {config.OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": config.OPENAI_TTS_MODEL,
+        "voice": voice or config.OPENAI_TTS_VOICE,
+        "input": text,
+        "response_format": "mp3",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            detail = "OpenAI TTS failed."
+            try:
+                err_data = e.response.json()
+                detail = err_data.get("error", {}).get("message", detail)
+            except Exception:
+                if e.response.text:
+                    detail = e.response.text[:300]
+            raise HTTPException(status_code=502, detail=detail)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"OpenAI TTS failed: {str(e)}")
+
+    if not resp.content:
+        raise HTTPException(status_code=502, detail="OpenAI TTS returned no audio.")
+    return resp.content
+
+
+def resolve_faster_whisper_runtime() -> tuple[str, str]:
+    """Choose faster-whisper device/compute_type settings for the runtime environment."""
+    import ctranslate2
+
+    device = config.FASTER_WHISPER_DEVICE
+    compute_type = config.FASTER_WHISPER_COMPUTE_TYPE
+
+    if device == "auto":
+        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+
+    if compute_type == "auto":
+        supported = ctranslate2.get_supported_compute_types(device)
+        if device == "cuda":
+            for candidate in ("int8_float16", "float16", "int8", "float32"):
+                if candidate in supported:
+                    compute_type = candidate
+                    break
+        else:
+            for candidate in ("int8", "int8_float32", "float32"):
+                if candidate in supported:
+                    compute_type = candidate
+                    break
+
+    return device, compute_type
+
+
+def get_faster_whisper_model():
+    """Get the faster-whisper model, loading it lazily."""
+    global faster_whisper_model
+
+    if faster_whisper_model is not None:
+        return faster_whisper_model
+
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"faster-whisper is not available: {str(e)}",
+        )
+
+    with faster_whisper_lock:
+        if faster_whisper_model is not None:
+            return faster_whisper_model
+
+        device, compute_type = resolve_faster_whisper_runtime()
+        faster_whisper_model = WhisperModel(
+            config.FASTER_WHISPER_MODEL,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=config.FASTER_WHISPER_CPU_THREADS,
+            num_workers=config.FASTER_WHISPER_NUM_WORKERS,
+            download_root=config.FASTER_WHISPER_DOWNLOAD_ROOT,
+            local_files_only=config.FASTER_WHISPER_LOCAL_FILES_ONLY,
+        )
+        print(
+            "Loaded faster-whisper model "
+            f"({config.FASTER_WHISPER_MODEL}, device={device}, compute_type={compute_type})"
+        )
+
+    return faster_whisper_model
+
+
+def guess_audio_extension(content_type: Optional[str]) -> str:
+    """Infer the file extension from the recording MIME type."""
+    mapping = {
+        "audio/webm": ".webm",
+        "video/webm": ".webm",
+        "audio/mp4": ".m4a",
+        "video/mp4": ".mp4",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/m4a": ".m4a",
+    }
+    return mapping.get((content_type or "").lower(), ".webm")
+
+
+async def transcribe_audio_openai(
+    audio_bytes: bytes,
+    filename: str,
+    content_type: Optional[str],
+) -> dict:
+    """Transcribe audio using the OpenAI Audio API."""
+    import httpx
+
+    if not config.OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Server-side transcription is not configured. Set OPENAI_API_KEY in the environment or .env.",
+        )
+
+    headers = {"Authorization": f"Bearer {config.OPENAI_API_KEY}"}
+    files = {
+        "file": (
+            filename,
+            audio_bytes,
+            content_type or "application/octet-stream",
+        )
+    }
+    data = {
+        "model": config.OPENAI_WHISPER_MODEL,
+        "language": config.OPENAI_TRANSCRIPTION_LANGUAGE,
+        "response_format": "json",
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers=headers,
+                data=data,
+                files=files,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            detail = "OpenAI transcription failed."
+            try:
+                err_data = e.response.json()
+                detail = err_data.get("error", {}).get("message", detail)
+            except Exception:
+                if e.response.text:
+                    detail = e.response.text[:300]
+            raise HTTPException(status_code=502, detail=detail)
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"OpenAI transcription failed: {str(e)}",
+            )
+
+    payload = resp.json()
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="Transcription returned an empty result.")
+
+    return {"text": text, "provider": "openai"}
+
+
+def _transcribe_audio_faster_whisper_file(audio_path: str) -> dict:
+    """Synchronous processing: transcribe a file with faster-whisper (including per-word probabilities)."""
+    model = get_faster_whisper_model()
+    segments, info = model.transcribe(
+        audio_path,
+        task="transcribe",
+        language=config.FASTER_WHISPER_LANGUAGE or None,
+        beam_size=config.FASTER_WHISPER_BEAM_SIZE,
+        vad_filter=config.FASTER_WHISPER_VAD_FILTER,
+        condition_on_previous_text=False,
+        word_timestamps=True,  # Get per-word probabilities and timestamps for the ASR confidence display
+    )
+
+    texts = []
+    words = []
+    for segment in segments:
+        if segment.text:
+            texts.append(segment.text.strip())
+        # Collect per-word ASR recognition probabilities
+        for w in (segment.words or []):
+            word = (w.word or "").strip()
+            if not word:
+                continue
+            words.append({
+                "word": word,
+                "probability": round(float(w.probability), 4),
+                "start": round(float(w.start), 3),
+                "end": round(float(w.end), 3),
+            })
+
+    text = " ".join(texts).strip()
+
+    if not text:
+        raise HTTPException(status_code=422, detail="No speech detected. Try again.")
+
+    return {
+        "text": text,
+        "provider": "faster_whisper",
+        "language": getattr(info, "language", None),
+        "duration": getattr(info, "duration", None),
+        "words": words,
+    }
+
+
+async def transcribe_audio_faster_whisper(
+    audio_bytes: bytes,
+    filename: str,
+    content_type: Optional[str],
+) -> dict:
+    """Transcribe audio using local faster-whisper."""
+    suffix = Path(filename).suffix or guess_audio_extension(content_type)
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_path = temp_file.name
+
+        return await asyncio.to_thread(_transcribe_audio_faster_whisper_file, temp_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Local Whisper transcription failed: {str(e)}",
+        )
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+async def get_llm_response(messages: list[dict]) -> str:
+    """Call the LLM based on the configuration."""
+    if config.LLM_PROVIDER == "ollama":
+        return await call_ollama(messages)
+    elif config.LLM_PROVIDER == "openai":
+        return await call_openai(messages)
+    elif config.LLM_PROVIDER == "anthropic":
+        return await call_anthropic(messages)
+    else:
+        raise HTTPException(status_code=500, detail=f"Unsupported LLM provider: {config.LLM_PROVIDER}")
+
+
+# ============================================================
+# LLM JSON Parser (robust)
+# ============================================================
+def parse_llm_json(raw: str) -> dict:
+    """
+    Reliably extract the JSON portion from an LLM response.
+    Handles Markdown code blocks, extra text, nested JSON, and similar cases.
+    """
+    fallback = {
+        "reply": "",
+        "corrections": [],
+        "natural_expression": None,
+        "encouragement": "",
+    }
+
+    if not raw or not raw.strip():
+        fallback["reply"] = "Sorry, I didn't get a response. Please try again."
+        return fallback
+
+    # 1. Strip markdown code block: ```json ... ``` or ``` ... ```
+    cleaned = re.sub(r'```(?:json)?\s*', '', raw)
+    cleaned = re.sub(r'```', '', cleaned).strip()
+
+    # 2. Try to find and parse a JSON object with "reply" key
+    # Use a non-greedy approach: find all { ... } candidates
+    candidates = []
+
+    # Find the outermost { ... } that contains "reply"
+    depth = 0
+    start = -1
+    for i, ch in enumerate(cleaned):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidates.append(cleaned[start:i+1])
+                start = -1
+
+    # Try each candidate, prefer the one with "reply" key
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and "reply" in obj:
+                # Validate reply is a plain string, not JSON
+                reply = obj.get("reply", "")
+                if isinstance(reply, str) and reply.strip().startswith('{'):
+                    try:
+                        inner = json.loads(reply)
+                        if isinstance(inner, dict) and "reply" in inner:
+                            return inner  # unwrap nested JSON
+                    except json.JSONDecodeError:
+                        pass
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    # 3. Fallback: treat the entire response as plain text reply
+    # Strip any JSON artifacts that leaked through
+    plain = raw.strip()
+    # Remove wrapping JSON if it looks like the raw JSON was the reply
+    if plain.startswith('{') and plain.endswith('}'):
+        try:
+            obj = json.loads(plain)
+            if isinstance(obj, dict) and "reply" in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # Final fallback: use raw text as the reply
+    fallback["reply"] = plain
+    return fallback
+
+
+# ============================================================
+# Session summary (today's learning report)
+# ============================================================
+# System prompt for LLM feedback (used once for this endpoint only)
+SUMMARY_FEEDBACK_PROMPT = """You are an encouraging English tutor writing a short end-of-session report for a Japanese learner.
+You will receive the session's conversation and the list of corrections made.
+
+Respond ONLY with this JSON. No other text:
+{"highlights": ["two specific things the student did well"], "focus_areas": ["two specific things to focus on next"], "phrase_to_remember": "one useful English phrase from this session worth memorizing", "message": "one short encouraging closing message in English"}
+
+Rules:
+- highlights and focus_areas must each have exactly 2 short items.
+- Base everything on the actual session content. Keep each item under 20 words.
+- ALL text must be in English only."""
+
+
+def _summary_str_list(value, limit: int) -> list[str]:
+    """Normalize an LLM feedback value to a list of strings (invalid types become an empty list)."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    items = []
+    for v in value:
+        if isinstance(v, (str, int, float)):
+            text = str(v).strip()
+            if text:
+                items.append(text)
+    return items[:limit]
+
+
+def parse_summary_llm_json(raw: str) -> dict:
+    """
+    Reliably extract LLM feedback JSON for /api/summary.
+    Do not use parse_llm_json here because it expects a "reply" key.
+    - Remove Markdown code blocks
+    - Collect {...} candidates while matching braces, then try json.loads in order
+    - On failure, return a fallback with empty highlights, etc.
+    """
+    fallback = {
+        "highlights": [],
+        "focus_areas": [],
+        "phrase_to_remember": None,
+        "message": "",
+    }
+
+    if not raw or not raw.strip():
+        return dict(fallback)
+
+    # Remove code block markers (```json / ```)
+    cleaned = re.sub(r"```(?:json)?", "", raw).strip()
+
+    # Track brace depth and collect {...} candidates in order from the beginning
+    candidates = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(cleaned):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(cleaned[start:i + 1])
+                    start = -1
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # Normalize the expected keys and types, then discard extra keys
+        phrase = obj.get("phrase_to_remember")
+        if not isinstance(phrase, str) or not phrase.strip():
+            phrase = None
+        message = obj.get("message")
+        if not isinstance(message, str):
+            message = ""
+        return {
+            "highlights": _summary_str_list(obj.get("highlights"), 2),
+            "focus_areas": _summary_str_list(obj.get("focus_areas"), 2),
+            "phrase_to_remember": phrase.strip() if phrase else None,
+            "message": message.strip(),
+        }
+
+    # Fallback if none of the candidates could be parsed
+    return dict(fallback)
+
+
+def build_session_summary_stats(data: dict) -> dict:
+    """Build the statistical portion of the session summary using rules (without an LLM)."""
+    turns = data.get("turns", [])
+    corrections = data.get("corrections", [])
+
+    # ASR recognition confidence (exclude NULL values from aggregation)
+    scores = [
+        t["pronunciation_score"]
+        for t in turns
+        if isinstance(t.get("pronunciation_score"), (int, float))
+    ]
+
+    # Error-type breakdown (normalize unset values to 'other', ordered by count descending)
+    error_counts: dict[str, int] = {}
+    for c in corrections:
+        error_type = (c.get("error_type") or "").strip() or "other"
+        error_counts[error_type] = error_counts.get(error_type, 0) + 1
+    error_types = [
+        {"error_type": et, "count": count}
+        for et, count in sorted(error_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    # Natural expressions learned (remove case-insensitive duplicates, preserving order)
+    seen = set()
+    natural_expressions = []
+    for t in turns:
+        expression = (t.get("natural_expression") or "").strip()
+        if expression and expression.lower() not in seen:
+            seen.add(expression.lower())
+            natural_expressions.append(expression)
+
+    return {
+        "turn_count": len(turns),
+        "avg_score": round(sum(scores) / len(scores), 1) if scores else None,
+        "max_score": max(scores) if scores else None,
+        "min_score": min(scores) if scores else None,
+        "correction_count": len(corrections),
+        "error_types": error_types,
+        "natural_expressions": natural_expressions,
+    }
+
+
+def build_summary_feedback_messages(data: dict) -> list[dict]:
+    """Build the message for LLM feedback (conversation content + correction list)."""
+    lines = ["# Conversation"]
+    # Apply modest turn-count and character limits to keep the prompt from growing too large
+    for t in data.get("turns", [])[:30]:
+        lines.append(f"Student: {(t.get('user_text') or '')[:200]}")
+        lines.append(f"Tutor: {(t.get('reply') or '')[:200]}")
+
+    lines.append("")
+    lines.append("# Corrections made during the session")
+    corrections = data.get("corrections", [])
+    if corrections:
+        for c in corrections[:30]:
+            error_type = (c.get("error_type") or "").strip() or "other"
+            lines.append(
+                f"- \"{(c.get('original') or '')[:120]}\" -> "
+                f"\"{(c.get('corrected') or '')[:120]}\" ({error_type})"
+            )
+    else:
+        lines.append("- (no corrections; the student spoke accurately)")
+
+    return [
+        {"role": "system", "content": SUMMARY_FEEDBACK_PROMPT},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+# ============================================================
+# API models
+# ============================================================
+class ChatRequest(BaseModel):
+    text: str
+    session_id: str = "default"
+    confidence: float = 0.0  # Web Speech API recognition confidence
+    words: list = Field(default_factory=list)  # Optional per-word probabilities from /api/transcribe
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = ""  # Optional: override the provider's default voice
+
+
+class ReviewAnswerRequest(BaseModel):
+    correction_id: int
+    answer_text: str
+
+
+# ============================================================
+# API endpoints
+# ============================================================
+@app.on_event("startup")
+async def startup():
+    """Initialize when the server starts."""
+    db.init_db()
+    print(f"SQLite database ready: {db.DB_PATH}")
+    load_cmu_dict()
+    print(f"\n{'='*50}")
+    print(f"  AI English Conversation Tutor - Starting...")
+    print(f"  LLM Provider: {config.LLM_PROVIDER}")
+    if config.LLM_PROVIDER == "ollama":
+        print(f"  Ollama Model: {config.OLLAMA_MODEL}")
+    elif config.LLM_PROVIDER == "openai":
+        print(f"  OpenAI Model: {config.OPENAI_MODEL}")
+    elif config.LLM_PROVIDER == "anthropic":
+        print(f"  Anthropic Model: {config.ANTHROPIC_MODEL}")
+    print(f"  STT Provider: {config.STT_PROVIDER}")
+    if config.STT_PROVIDER == "faster_whisper":
+        print(f"  Whisper Model: {config.FASTER_WHISPER_MODEL}")
+    print(f"{'='*50}\n")
+
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """
+    Main conversation endpoint.
+    - Receive the user's English text
+    - Generate corrections and a response with the LLM
+    - Add IPA pronunciations
+    - Calculate ASR recognition confidence (not pronunciation accuracy)
+    """
+    user_text = req.text.strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Text is empty.")
+
+    # Get recent conversation history from the database
+    history = db.get_history(req.session_id, config.MAX_CONVERSATION_HISTORY)
+
+    # Build messages
+    messages = [{"role": "system", "content": config.SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+
+    # Call the LLM
+    raw_response = await get_llm_response(messages)
+
+    # Parse the JSON response
+    ai_response = parse_llm_json(raw_response)
+    if not ai_response.get("reply"):
+        ai_response["reply"] = raw_response
+
+    # Get pronunciations
+    user_ipa = get_sentence_ipa(user_text)
+    reply_ipa = get_sentence_ipa(ai_response.get("reply", ""))
+
+    # Keep the API key for backward compatibility; the value is ASR confidence, not pronunciation accuracy.
+    pronunciation_score = calculate_speech_recognition_confidence(req.words)
+    if (
+        pronunciation_score["method"] == "unavailable"
+        and 0 < req.confidence <= 1
+    ):
+        browser_confidence = round(req.confidence * 100)
+        pronunciation_score = {
+            "overall_score": browser_confidence,
+            "word_count": len(re.findall(r"[a-zA-Z']+", user_text)),
+            "details": (
+                "Browser speech-recognition confidence. "
+                "This is not a pronunciation-accuracy score."
+            ),
+            "method": "browser_asr_confidence",
+            "recognition_confidence": browser_confidence,
+            "word_scores": [],
+        }
+
+    # Save the conversation turn to the database (persist history, corrections, and score)
+    db.save_turn(
+        req.session_id,
+        user_text,
+        ai_response,
+        pronunciation_score.get("overall_score"),
+    )
+
+    return JSONResponse({
+        "reply": ai_response.get("reply", raw_response),
+        "corrections": ai_response.get("corrections", []),
+        "natural_expression": ai_response.get("natural_expression"),
+        "encouragement": ai_response.get("encouragement", ""),
+        "user_ipa": user_ipa,
+        "reply_ipa": reply_ipa,
+        "pronunciation_score": pronunciation_score,
+    })
+
+
+@app.post("/api/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    """Transcribe recorded audio on the server."""
+    audio_bytes = await audio.read()
+    try:
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Audio file is empty.")
+
+        if len(audio_bytes) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Audio file is too large. Keep it under 25 MB.")
+
+        content_type = audio.content_type or "application/octet-stream"
+        filename = audio.filename or f"recording{guess_audio_extension(content_type)}"
+
+        if config.STT_PROVIDER == "faster_whisper":
+            result = await transcribe_audio_faster_whisper(audio_bytes, filename, content_type)
+        elif config.STT_PROVIDER == "openai":
+            result = await transcribe_audio_openai(audio_bytes, filename, content_type)
+        elif config.STT_PROVIDER == "disabled":
+            raise HTTPException(status_code=503, detail="Server-side transcription is disabled.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Unsupported STT provider: {config.STT_PROVIDER}")
+
+        return JSONResponse(result)
+    finally:
+        await audio.close()
+
+
+@app.post("/api/pronunciation")
+async def get_pronunciation(req: TTSRequest):
+    """Get only the IPA pronunciation for the text."""
+    ipa_data = get_sentence_ipa(req.text)
+    return JSONResponse({"ipa": ipa_data})
+
+
+@app.post("/api/tts")
+async def text_to_speech(req: TTSRequest):
+    """Synthesize speech from text on the server and return an MP3.
+    - provider=edge: edge-tts (free, requires a network connection)
+    - provider=openai: OpenAI Audio Speech API
+    - provider=browser: return 503 to fall back to client-side TTS
+    """
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is empty.")
+    if len(text) > TTS_MAX_TEXT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Text is too long. Keep it under {TTS_MAX_TEXT_LENGTH} characters.",
+        )
+
+    if config.TTS_PROVIDER == "edge":
+        audio = await synthesize_speech_edge(text, req.voice)
+    elif config.TTS_PROVIDER == "openai":
+        audio = await synthesize_speech_openai(text, req.voice)
+    elif config.TTS_PROVIDER == "browser":
+        # The frontend receives 503 and falls back to the Web Speech API
+        raise HTTPException(
+            status_code=503,
+            detail="Server-side TTS is disabled. Use client-side speech synthesis.",
+        )
+    else:
+        raise HTTPException(status_code=500, detail=f"Unsupported TTS provider: {config.TTS_PROVIDER}")
+
+    return Response(content=audio, media_type="audio/mpeg")
+
+
+@app.get("/api/sessions")
+async def list_sessions(limit: int = 20):
+    """Return recent sessions (the basis for the weakness dashboard)."""
+    return JSONResponse({"sessions": db.get_recent_sessions(limit)})
+
+
+@app.get("/api/corrections")
+async def list_corrections(limit: int = 100):
+    """Return correction history for all sessions (the basis for the weakness dashboard)."""
+    return JSONResponse({"corrections": db.get_all_corrections(limit)})
+
+
+@app.get("/api/review/due")
+async def review_due(limit: int = 10):
+    """Return corrections due for review (not yet reviewed or past their due date).
+    Ordered by error_type frequency, then oldest first (prioritize weaker areas).
+    """
+    limit = max(1, min(limit, 50))
+    return JSONResponse({"reviews": db.get_due_reviews(limit)})
+
+
+@app.post("/api/review/answer")
+async def review_answer(req: ReviewAnswerRequest):
+    """Check the review answer and update the SRS state.
+    - Uses normalized comparison without an LLM (fast and works offline)
+    - Exact matches set correct=True; similarity >= 0.85 sets close=True ("almost")
+    """
+    correction = db.get_correction(req.correction_id)
+    if correction is None:
+        raise HTTPException(status_code=404, detail="Correction not found")
+
+    result = judge_review_answer(req.answer_text, correction["corrected"] or "")
+    # Update SRS state (extend the interval for correct answers; retry the next day if incorrect)
+    srs = db.record_review_result(req.correction_id, result["correct"])
+
+    return JSONResponse({
+        "correct": result["correct"],
+        "close": result["close"],
+        "ratio": result["ratio"],
+        "corrected": correction["corrected"],
+        "explanation": correction["explanation"],
+        "error_type": correction["error_type"],
+        "srs": srs,
+    })
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Return statistics for the weakness dashboard.
+    - total_corrections / total_turns / avg_score
+    - error_stats: counts and recent examples for each error type (count descending)
+    - recent_scores: recent ASR confidence trend (oldest first)
+    """
+    overview = db.get_dashboard_stats()
+    return JSONResponse({
+        "total_corrections": overview["total_corrections"],
+        "total_turns": overview["total_turns"],
+        "avg_score": overview["avg_score"],
+        "error_stats": db.get_error_stats(),
+        "recent_scores": overview["recent_scores"],
+    })
+
+
+@app.get("/api/summary/{session_id}")
+async def session_summary(session_id: str):
+    """Return the session summary (today's learning report).
+    - The statistics are rule-based (turn count / average, highest, and lowest scores / error breakdown / learned expressions)
+    - Generate feedback with one LLM call; on failure, set it to null and return the statistics with 200
+    """
+    data = db.get_session_summary_data(session_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="There is no conversation in this session yet.")
+
+    stats = build_session_summary_stats(data)
+
+    # LLM feedback (call once; return the statistics even if it fails)
+    feedback = None
+    try:
+        raw = await get_llm_response(build_summary_feedback_messages(data))
+        feedback = parse_summary_llm_json(raw)
+    except Exception as e:
+        # Continue without feedback (null) for connection failures, API errors, etc.
+        print(f"Summary feedback generation failed: {e}")
+        feedback = None
+
+    return JSONResponse({
+        "session_id": session_id,
+        "stats": stats,
+        "feedback": feedback,
+    })
+
+
+@app.get("/api/health")
+async def health():
+    """Health check."""
+    return {
+        "status": "ok",
+        "provider": config.LLM_PROVIDER,
+        "llm_model": get_llm_display_name(),
+        "llm_ready": is_llm_ready(),
+        "stt_provider": config.STT_PROVIDER,
+        "stt_model": get_stt_display_name(),
+        "stt_ready": is_stt_ready(),
+        "tts_provider": config.TTS_PROVIDER,
+        "tts_ready": is_tts_ready(),
+    }
+
+
+@app.get("/api/models")
+async def list_models():
+    """List available Ollama models."""
+    if config.LLM_PROVIDER == "openai":
+        return {"models": [config.OPENAI_MODEL], "current": config.OPENAI_MODEL}
+    if config.LLM_PROVIDER == "anthropic":
+        return {"models": [config.ANTHROPIC_MODEL], "current": config.ANTHROPIC_MODEL}
+    if config.LLM_PROVIDER != "ollama":
+        return {"models": [], "current": None}
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{config.OLLAMA_BASE_URL}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            models = [m["name"] for m in data.get("models", [])]
+            return {"models": models, "current": config.OLLAMA_MODEL}
+    except Exception:
+        return {"models": [], "current": config.OLLAMA_MODEL, "error": "Could not connect to Ollama."}
+
+
+# ============================================================
+# Serve static files
+# ============================================================
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ============================================================
+# Network helpers / automatic SSL certificate generation
+# ============================================================
+def parse_windows_ipconfig() -> list[tuple[str, str]]:
+    """Extract (adapter, ipv4) from Windows ipconfig output."""
+    try:
+        result = subprocess.run(
+            ["ipconfig"],
+            capture_output=True,
+            text=True,
+            encoding=locale.getpreferredencoding(False),
+            errors="ignore",
+            check=True,
+        )
+    except Exception:
+        return []
+
+    entries: list[tuple[str, str]] = []
+    current_adapter = None
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if not line.startswith(" ") and "adapter" in stripped.lower() and stripped.endswith(":"):
+            current_adapter = stripped[:-1]
+            continue
+
+        if "IPv4 Address" in stripped or "IPv4 アドレス" in stripped:
+            match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", stripped)
+            if match and current_adapter:
+                entries.append((current_adapter, match.group(1)))
+
+    return entries
+
+
+def get_tailscale_status() -> dict:
+    """Get tailscale status --json."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=True,
+        )
+        return json.loads(result.stdout)
+    except Exception:
+        return {}
+
+
+def collect_tailscale_dns_names() -> list[str]:
+    """Collect Tailscale names available through MagicDNS."""
+    status = get_tailscale_status()
+    self_data = status.get("Self", {})
+
+    names = set()
+    dns_name = (self_data.get("DNSName") or "").strip().rstrip(".")
+    host_name = (self_data.get("HostName") or "").strip()
+
+    if dns_name:
+        names.add(dns_name)
+        short_name = dns_name.split(".", 1)[0]
+        if short_name:
+            names.add(short_name)
+
+    if host_name:
+        names.add(host_name)
+        names.add(host_name.lower())
+
+    return sorted(name for name in names if name)
+
+
+def collect_network_ipv4_addresses() -> list[str]:
+    """Collect IPv4 addresses for certificate SANs and connection instructions."""
+    import ipaddress
+    import socket
+
+    ips: set[str] = {"127.0.0.1"}
+    hostnames = {socket.gethostname(), socket.getfqdn(), "localhost"}
+
+    for name in hostnames:
+        if not name:
+            continue
+        try:
+            for result in socket.getaddrinfo(name, None, socket.AF_INET):
+                ip = result[4][0]
+                if ip and ip != "127.0.0.1":
+                    ips.add(ip)
+        except OSError:
+            continue
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+
+    for _adapter, ip in parse_windows_ipconfig():
+        ips.add(ip)
+
+    valid_ips = []
+    for ip in ips:
+        try:
+            parsed = ipaddress.ip_address(ip)
+            if parsed.version == 4:
+                valid_ips.append(str(parsed))
+        except ValueError:
+            continue
+
+    return sorted(valid_ips, key=lambda ip: tuple(int(part) for part in ip.split(".")))
+
+
+def collect_certificate_dns_names() -> list[str]:
+    """Collect DNS names to include in the certificate."""
+    import socket
+
+    names = {"localhost", socket.gethostname(), socket.getfqdn()}
+    names.update(collect_tailscale_dns_names())
+    cleaned = [name.strip() for name in names if name and name.strip()]
+    return sorted(set(cleaned))
+
+
+def collect_access_urls() -> list[tuple[str, str]]:
+    """Build access URLs to display at startup."""
+    urls: list[tuple[str, str]] = [("PC", f"https://localhost:{config.PORT}")]
+
+    tailscale_names = collect_tailscale_dns_names()
+    fqdn = next((name for name in tailscale_names if ".ts.net" in name), None)
+    if fqdn:
+        urls.append(("VPN DNS", f"https://{fqdn}:{config.PORT}"))
+
+    for adapter, ip in parse_windows_ipconfig():
+        adapter_lower = adapter.lower()
+        if "tailscale" in adapter_lower:
+            label = "VPN"
+        elif "ethernet" in adapter_lower or "イーサネット" in adapter or "wi-fi" in adapter_lower or "wifi" in adapter_lower:
+            label = "LAN"
+        else:
+            label = "Network"
+        urls.append((label, f"https://{ip}:{config.PORT}"))
+
+    seen = set()
+    deduped = []
+    for label, url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        deduped.append((label, url))
+    return deduped
+
+
+def existing_cert_covers_targets(certfile: str, dns_names: list[str], ip_addresses: list[str]) -> bool:
+    """Check whether the existing certificate has all required DNS names and IP addresses in its SAN."""
+    import ssl
+
+    try:
+        cert = ssl._ssl._test_decode_cert(certfile)
+    except Exception:
+        return False
+
+    san_entries = cert.get("subjectAltName", ())
+    existing_dns = {value for kind, value in san_entries if kind == "DNS"}
+    existing_ips = {value for kind, value in san_entries if kind == "IP Address"}
+    return set(dns_names).issubset(existing_dns) and set(ip_addresses).issubset(existing_ips)
+
+
+def generate_self_signed_cert():
+    """Generate self-signed SSL cert using Python (no openssl CLI needed)"""
+    dns_names = collect_certificate_dns_names()
+    ip_addresses = ["0.0.0.0"] + [
+        ip for ip in collect_network_ipv4_addresses()
+        if ip != "0.0.0.0"
+    ]
+
+    cert_exists = os.path.exists(config.SSL_CERTFILE) and os.path.exists(config.SSL_KEYFILE)
+    if cert_exists and existing_cert_covers_targets(config.SSL_CERTFILE, dns_names, ip_addresses):
+        print("Using existing SSL certificate")
+        return
+    if cert_exists:
+        print("Regenerating SSL certificate to include current network addresses...")
+
+    print("Generating self-signed SSL certificate...")
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import datetime
+        import ipaddress
+
+        # Generate RSA key
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+        # Build certificate
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "AI-English-Tutor"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Local"),
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "JP"),
+        ])
+
+        san_list = [x509.DNSName(name) for name in dns_names]
+        san_list.extend(
+            x509.IPAddress(ipaddress.IPv4Address(ip))
+            for ip in ip_addresses
+        )
+
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
+            .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+            .sign(key, hashes.SHA256())
+        )
+
+        # Write key file
+        with open(config.SSL_KEYFILE, "wb") as f:
+            f.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+
+        # Write cert file
+        with open(config.SSL_CERTFILE, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        print(
+            "SSL certificate generated "
+            f"(SAN includes: {', '.join(ip_addresses)})"
+        )
+
+    except ImportError:
+        print("ERROR: 'cryptography' package not found.")
+        print("Run:  pip install cryptography")
+        print("Microphone will NOT work on mobile without HTTPS.")
+    except Exception as e:
+        print(f"SSL certificate generation failed: {e}")
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    generate_self_signed_cert()
+
+    print(f"\n{'='*50}")
+    print(f"  AI English Conversation Tutor")
+    print(f"  ")
+    for label, url in collect_access_urls():
+        print(f"  {label:<10} {url}")
+    print(f"  ")
+    print(f"  * On first mobile access, you will see a")
+    print(f"    security warning. Tap 'Advanced' then")
+    print(f"    'Proceed' to continue (self-signed cert).")
+    print(f"{'='*50}\n")
+
+    use_ssl = os.path.exists(config.SSL_CERTFILE) and os.path.exists(config.SSL_KEYFILE)
+
+    uvicorn.run(
+        app,
+        host=config.HOST,
+        port=config.PORT,
+        ssl_certfile=config.SSL_CERTFILE if use_ssl else None,
+        ssl_keyfile=config.SSL_KEYFILE if use_ssl else None,
+    )
