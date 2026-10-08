@@ -8,7 +8,9 @@ An AI-powered English practice application that runs on your own computer. Chat 
 ![Ollama](https://img.shields.io/badge/LLM-Ollama%20(ornith%3A9b)-black)
 
 <p align="center">
-  <img src="docs/screenshots/01-welcome.png" alt="English Bee welcome screen" width="800">
+  <img src="ai-english-conversation-tutor/docs/assets/01-welcome.png"
+       alt="English Bee welcome screen"
+       width="800">
 </p>
 
 ## Table of Contents
